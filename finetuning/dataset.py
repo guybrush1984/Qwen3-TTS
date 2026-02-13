@@ -137,11 +137,14 @@ class TTSDataset(Dataset):
 
         ref_mel = self.extract_mels(audio=wav, sr=sr)
 
-        return {
+        result = {
             "text_ids": text_ids[:,:-5],    # 1 , t
             "audio_codes":audio_codes,      # t, 16
             "ref_mel":ref_mel
         }
+        if "speaker_id" in item:
+            result["speaker_id"] = item["speaker_id"]
+        return result
         
     def collate_fn(self, batch):
         assert self.lag_num == -1
@@ -204,9 +207,11 @@ class TTSDataset(Dataset):
             attention_mask[i, :8+text_ids_len+codec_ids_len] = True
         
         ref_mels = [data['ref_mel'] for data in batch]
+        max_time = max(m.shape[1] for m in ref_mels)
+        ref_mels = [torch.nn.functional.pad(m, (0, 0, 0, max_time - m.shape[1])) for m in ref_mels]
         ref_mels = torch.cat(ref_mels,dim=0)
 
-        return {
+        result = {
             'input_ids':input_ids,
             'ref_mels':ref_mels,
             'attention_mask':attention_mask,
@@ -216,3 +221,6 @@ class TTSDataset(Dataset):
             'codec_ids': codec_ids,
             'codec_mask':codec_mask
         }
+        if 'speaker_id' in batch[0]:
+            result['speaker_ids'] = [data['speaker_id'] for data in batch]
+        return result
