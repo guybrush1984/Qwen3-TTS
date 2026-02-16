@@ -19,6 +19,7 @@ import os
 import shutil
 
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 from dataset import TTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
@@ -36,7 +37,7 @@ def train():
     parser.add_argument("--output_model_path", type=str, default="output")
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=2e-6)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     args = parser.parse_args()
@@ -86,7 +87,13 @@ def train():
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
-                input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+                input_text_embedding = model.talker.model.text_embedding(input_text_ids)
+
+                # Apply text_projection for 0.6B model (text_hidden_size != hidden_size)
+                if hasattr(model.talker, 'text_projection'):
+                    input_text_embedding = model.talker.text_projection(input_text_embedding)
+
+                input_text_embedding = input_text_embedding * text_embedding_mask
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
                 input_codec_embedding[:, 6, :] = speaker_embedding
 
@@ -97,20 +104,36 @@ def train():
                     codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
                     input_embeddings = input_embeddings + codec_i_embedding
 
+                # Don't pass labels= to model.talker() — HF's ForCausalLMLoss
+                # shifts internally, causing double-shift with our manual
+                # :-1 / 1: slicing. See: github.com/QwenLM/Qwen3-TTS/issues/179
                 outputs = model.talker(
                     inputs_embeds=input_embeddings[:, :-1, :],
                     attention_mask=attention_mask[:, :-1],
-                    labels=codec_0_labels[:, 1:],
                     output_hidden_states=True
+                )
+
+                # Compute main loss manually (F.cross_entropy does not shift)
+                logits = outputs.logits
+                loss_main = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    codec_0_labels[:, 1:].reshape(-1),
+                    ignore_index=-100,
                 )
 
                 hidden_states = outputs.hidden_states[0][-1]
                 talker_hidden_states = hidden_states[codec_mask[:, 1:]]
                 talker_codec_ids = codec_ids[codec_mask]
 
-                sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+                # Same double-shift bug in sub-talker: forward_sub_talker_finetune
+                # uses ForCausalLMLoss on already-aligned logits/labels.
+                sub_talker_logits, _ = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+                sub_talker_loss = F.cross_entropy(
+                    sub_talker_logits.reshape(-1, sub_talker_logits.size(-1)),
+                    talker_codec_ids[:, 1:].reshape(-1),
+                )
 
-                loss = outputs.loss + 0.3 * sub_talker_loss
+                loss = loss_main + 0.3 * sub_talker_loss
 
                 accelerator.backward(loss)
 
