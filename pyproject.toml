@@ -39,7 +39,7 @@ Repository = "https://github.com/Qwen/Qwen3-TTS"
 qwen-tts-demo = "qwen_tts.cli.demo:main"
 
 [tool.setuptools]
-packages = { find = { where = ["."] , include = ["qwen_tts*"] } }
+packages = { find = { where = ["."] , include = ["qwen_tts*", "finetuning*"] } }
 include-package-data = true
 
 [tool.setuptools.package-data]
