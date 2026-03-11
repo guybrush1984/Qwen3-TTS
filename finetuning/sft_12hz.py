@@ -188,11 +188,14 @@ def _train_step(
 
     input_embeddings = input_text_embedding + input_codec_embedding
 
-    # NOTE: We intentionally do NOT add codec layers 1-15 to input_embeddings.
-    # These layers are predicted by the sub-talker at inference time and are not
-    # available to the AR model. Including them breaks causality and causes
-    # speech to accelerate over training epochs.
-    # See: https://github.com/QwenLM/Qwen3-TTS/pull/178
+    # Add sub-talker codec layers 1-15 to input embeddings.
+    # Reverted removal from PR #178 — removing these caused speech to be too fast.
+    for i in range(1, 16):
+        codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](
+            codec_ids[:, :, i]
+        )
+        codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
+        input_embeddings = input_embeddings + codec_i_embedding
 
     # Main AR forward — don't pass labels= (HF shifts internally, causing
     # double-shift). See: github.com/QwenLM/Qwen3-TTS/issues/179
