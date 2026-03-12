@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../qwen3-tts-finetune"
+		},
+		{
+			"path": "../qwen3-tts-service"
+		},
+		{
+			"path": "../voice-store"
+		}
+	]
+}

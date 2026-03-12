@@ -1064,7 +1064,9 @@ class Qwen3TTSTokenizerV1DecoderBigVGANModel(Qwen3TTSTokenizerV1DecoderPreTraine
 
         hidden_representation = self.activation_post(hidden_representation)
         output_waveform = self.conv_post(hidden_representation)
-        return torch.clamp(output_waveform, min=-1.0, max=1.0).squeeze(1)
+        # Normalize peaks that exceed [-1, 1] instead of hard-clamping
+        peak = output_waveform.abs().amax(dim=-1, keepdim=True).clamp(min=1.0)
+        return (output_waveform / peak).squeeze(1)
 
 
 @auto_docstring
