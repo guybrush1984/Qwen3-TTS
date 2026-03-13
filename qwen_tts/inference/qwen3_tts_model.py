@@ -478,6 +478,7 @@ class Qwen3TTSModel:
         ref_text: Optional[Union[str, List[Optional[str]]]] = None,
         x_vector_only_mode: Union[bool, List[bool]] = False,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[VoiceClonePromptItem]]] = None,
+        instruct: Optional[Union[str, List[str]]] = None,
         non_streaming_mode: bool = False,
         **kwargs,
     ) -> Tuple[List[np.ndarray], int]:
@@ -601,10 +602,22 @@ class Qwen3TTSModel:
                     ref_tok = self._tokenize_texts([self._build_ref_text(rt)])[0]
                     ref_ids.append(ref_tok)
 
+        # Build instruct_ids if instruct is provided
+        instructs = self._ensure_list(instruct) if isinstance(instruct, list) else ([instruct] * len(texts) if instruct is not None else [""] * len(texts))
+        if len(instructs) == 1 and len(texts) > 1:
+            instructs = instructs * len(texts)
+        instruct_ids: List[Optional[torch.Tensor]] = []
+        for ins in instructs:
+            if ins is None or ins == "":
+                instruct_ids.append(None)
+            else:
+                instruct_ids.append(self._tokenize_texts([self._build_instruct_text(ins)])[0])
+
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
 
         talker_codes_list, _ = self.model.generate(
             input_ids=input_ids,
+            instruct_ids=instruct_ids,
             ref_ids=ref_ids,
             voice_clone_prompt=voice_clone_prompt_dict,
             languages=languages,
