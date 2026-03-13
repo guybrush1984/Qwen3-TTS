@@ -2029,6 +2029,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         speakers: list[str] = None,
         non_streaming_mode = False,
         max_new_tokens: int = 4096,
+        min_new_tokens: int = 2,
         do_sample: bool = True,
         top_k: int = 50,
         top_p: float = 1.0,
@@ -2043,7 +2044,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     ):
         talker_kwargs = {
             "max_new_tokens": max_new_tokens,
-            "min_new_tokens": 2,
+            "min_new_tokens": min_new_tokens,
             "do_sample": do_sample,
             "top_k": top_k,
             "top_p": top_p,

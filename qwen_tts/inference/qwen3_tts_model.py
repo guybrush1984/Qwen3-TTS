@@ -296,6 +296,7 @@ class Qwen3TTSModel:
         subtalker_top_p: Optional[float] = None,
         subtalker_temperature: Optional[float] = None,
         max_new_tokens: Optional[int] = None,
+        min_new_tokens: Optional[int] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -327,6 +328,7 @@ class Qwen3TTSModel:
             subtalker_top_p=1.0,
             subtalker_temperature=0.9,
             max_new_tokens=2048,
+            min_new_tokens=2,
         )
 
         def pick(name: str, user_val: Any) -> Any:
@@ -348,6 +350,7 @@ class Qwen3TTSModel:
             subtalker_top_p=pick("subtalker_top_p", subtalker_top_p),
             subtalker_temperature=pick("subtalker_temperature", subtalker_temperature),
             max_new_tokens=pick("max_new_tokens", max_new_tokens),
+            min_new_tokens=pick("min_new_tokens", min_new_tokens),
         )
         return merged
 
