@@ -41,7 +41,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
 
-FREEZE_STRATEGIES = ("none", "timbre", "timbre_strict")
+TRAINING_STRATEGIES = ("full", "voice_and_prosody", "voice", "voice_minimal")
 
 
 def run_sft(
@@ -55,7 +55,7 @@ def run_sft(
     gradient_accumulation_steps: int = 4,
     sub_talker_weight: float = 0.3,
     keep_all_checkpoints: bool = False,
-    freeze_strategy: str = "none",
+    training_strategy: str = "full",
     on_epoch_end: Optional[Callable[[int, str, float], None]] = None,
 ) -> dict:
     """Core SFT training loop.
@@ -71,22 +71,25 @@ def run_sft(
         gradient_accumulation_steps: Gradient accumulation steps.
         sub_talker_weight: Weight for sub-talker loss (default 0.3).
         keep_all_checkpoints: If False, only keep latest checkpoint.
-        freeze_strategy: Controls which parameters are trained:
-            "none"          — no freezing, train all params (default).
-            "timbre"        — freeze talker LLM, train speaker embedding +
-                              full sub-talker (codec_embedding + layers + heads).
-            "timbre_strict" — like "timbre" but also freeze the sub-talker's
-                              codec embeddings (the feedback path into the LLM),
-                              preserving the LLM's input distribution and rhythm.
+        training_strategy: Controls which parameters are trained (most → least):
+            "full"             — train all params (default).
+            "voice_and_prosody" — freeze talker LLM, train speaker embedding +
+                                 sub-talker + codec_head (rhythm/timing adapts).
+            "voice"            — freeze talker LLM + codec_head, train speaker
+                                 embedding + full sub-talker.
+            "voice_minimal"    — like "voice" but also freeze sub-talker codec
+                                 embeddings (the feedback path into the LLM),
+                                 training only sub-talker layers/heads + speaker
+                                 embedding.
         on_epoch_end: Callback(epoch, checkpoint_dir, avg_loss) after each epoch save.
 
     Returns:
         {"loss_history": [...], "speaker_id_map": {name: idx}, "speaker_embeddings": {name: tensor}}
     """
-    if freeze_strategy not in FREEZE_STRATEGIES:
+    if training_strategy not in TRAINING_STRATEGIES:
         raise ValueError(
-            f"Unknown freeze_strategy={freeze_strategy!r}, "
-            f"expected one of {FREEZE_STRATEGIES}"
+            f"Unknown training_strategy={training_strategy!r}, "
+            f"expected one of {TRAINING_STRATEGIES}"
         )
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -105,19 +108,24 @@ def run_sft(
         dataset, batch_size=batch_size, shuffle=True, collate_fn=dataset.collate_fn,
     )
 
-    if freeze_strategy != "none":
+    if training_strategy != "full":
         # Freeze the main talker LLM (transformer layers, norms, heads) to
         # preserve timing/pacing/EOS behavior from the base model.
         for param in qwen3tts.model.talker.parameters():
             param.requires_grad = False
         # Unfreeze speaker embedding slot
         qwen3tts.model.talker.model.codec_embedding.weight.requires_grad = True
-        # Unfreeze sub-talker (code_predictor) prediction layers
+        # Unfreeze sub-talker (code_predictor)
         for param in qwen3tts.model.talker.code_predictor.parameters():
             param.requires_grad = True
 
-        if freeze_strategy == "timbre_strict":
-            # Also freeze the sub-talker's codec embeddings — these feed back
+        if training_strategy == "voice_and_prosody":
+            # Also unfreeze codec_head — the linear layer that predicts
+            # codec_0 tokens (including rhythm/timing decisions).
+            for param in qwen3tts.model.talker.codec_head.parameters():
+                param.requires_grad = True
+        elif training_strategy == "voice_minimal":
+            # Freeze the sub-talker's codec embeddings — these feed back
             # into the LLM input, so freezing them preserves the LLM's input
             # distribution and thus its rhythm.
             for param in qwen3tts.model.talker.code_predictor.model.codec_embedding.parameters():
@@ -127,7 +135,7 @@ def run_sft(
         n_trainable = sum(p.numel() for p in trainable)
         n_total = sum(p.numel() for p in qwen3tts.model.parameters())
         accelerator.print(
-            f"  freeze_strategy={freeze_strategy!r}: training {n_trainable:,} / "
+            f"  training_strategy={training_strategy!r}: training {n_trainable:,} / "
             f"{n_total:,} params ({100 * n_trainable / n_total:.1f}%)"
         )
         optimizer = AdamW(trainable, lr=lr, weight_decay=0.01)
@@ -336,9 +344,9 @@ def train():
     parser.add_argument("--lr", type=float, default=2e-6)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
-    parser.add_argument("--freeze_strategy", type=str, default="none",
-                        choices=FREEZE_STRATEGIES,
-                        help="none=train all, timbre=freeze LLM, timbre_strict=also freeze feedback embeddings")
+    parser.add_argument("--training_strategy", type=str, default="full",
+                        choices=TRAINING_STRATEGIES,
+                        help="full > voice_and_prosody > voice > voice_minimal (most to least params trained)")
     args = parser.parse_args()
 
     with open(args.train_jsonl) as f:
@@ -352,7 +360,7 @@ def train():
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        freeze_strategy=args.freeze_strategy,
+        training_strategy=args.training_strategy,
     )
 
     print(f"Training complete. Loss history: {result['loss_history']}")
