@@ -41,7 +41,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
 
-FREEZE_STRATEGIES = ("full", "timbre", "timbre_strict")
+FREEZE_STRATEGIES = ("none", "timbre", "timbre_strict")
 
 
 def run_sft(
@@ -55,7 +55,7 @@ def run_sft(
     gradient_accumulation_steps: int = 4,
     sub_talker_weight: float = 0.3,
     keep_all_checkpoints: bool = False,
-    freeze_strategy: str = "full",
+    freeze_strategy: str = "none",
     on_epoch_end: Optional[Callable[[int, str, float], None]] = None,
 ) -> dict:
     """Core SFT training loop.
@@ -72,7 +72,7 @@ def run_sft(
         sub_talker_weight: Weight for sub-talker loss (default 0.3).
         keep_all_checkpoints: If False, only keep latest checkpoint.
         freeze_strategy: Controls which parameters are trained:
-            "full"          — train all params (default).
+            "none"          — no freezing, train all params (default).
             "timbre"        — freeze talker LLM, train speaker embedding +
                               full sub-talker (codec_embedding + layers + heads).
             "timbre_strict" — like "timbre" but also freeze the sub-talker's
@@ -105,7 +105,7 @@ def run_sft(
         dataset, batch_size=batch_size, shuffle=True, collate_fn=dataset.collate_fn,
     )
 
-    if freeze_strategy != "full":
+    if freeze_strategy != "none":
         # Freeze the main talker LLM (transformer layers, norms, heads) to
         # preserve timing/pacing/EOS behavior from the base model.
         for param in qwen3tts.model.talker.parameters():
@@ -336,9 +336,9 @@ def train():
     parser.add_argument("--lr", type=float, default=2e-6)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
-    parser.add_argument("--freeze_strategy", type=str, default="full",
+    parser.add_argument("--freeze_strategy", type=str, default="none",
                         choices=FREEZE_STRATEGIES,
-                        help="full=train all, timbre=freeze LLM, timbre_strict=also freeze feedback embeddings")
+                        help="none=train all, timbre=freeze LLM, timbre_strict=also freeze feedback embeddings")
     args = parser.parse_args()
 
     with open(args.train_jsonl) as f:
