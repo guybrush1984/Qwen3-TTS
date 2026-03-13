@@ -52,6 +52,7 @@ def run_sft(
     gradient_accumulation_steps: int = 4,
     sub_talker_weight: float = 0.3,
     keep_all_checkpoints: bool = False,
+    freeze_talker: bool = False,
     on_epoch_end: Optional[Callable[[int, str, float], None]] = None,
 ) -> dict:
     """Core SFT training loop.
@@ -67,6 +68,9 @@ def run_sft(
         gradient_accumulation_steps: Gradient accumulation steps.
         sub_talker_weight: Weight for sub-talker loss (default 0.3).
         keep_all_checkpoints: If False, only keep latest checkpoint.
+        freeze_talker: If True, freeze the main talker LLM layers so only the
+            speaker embedding and sub-talker (timbre) are trained. This preserves
+            the base model's timing/pacing/EOS behavior.
         on_epoch_end: Callback(epoch, checkpoint_dir, avg_loss) after each epoch save.
 
     Returns:
@@ -89,7 +93,28 @@ def run_sft(
         dataset, batch_size=batch_size, shuffle=True, collate_fn=dataset.collate_fn,
     )
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=lr, weight_decay=0.01)
+    if freeze_talker:
+        # Freeze the main talker LLM (transformer layers, norms, heads) to
+        # preserve timing/pacing/EOS behavior from the base model.
+        # Only codec_embedding (speaker identity) and code_predictor
+        # (sub-talker, timbre) remain trainable.
+        for param in qwen3tts.model.talker.parameters():
+            param.requires_grad = False
+        for param in qwen3tts.model.talker.code_predictor.parameters():
+            param.requires_grad = True
+        qwen3tts.model.talker.model.codec_embedding.weight.requires_grad = True
+
+        trainable = [p for p in qwen3tts.model.parameters() if p.requires_grad]
+        n_trainable = sum(p.numel() for p in trainable)
+        n_total = sum(p.numel() for p in qwen3tts.model.parameters())
+        accelerator.print(
+            f"  freeze_talker: training {n_trainable:,} / {n_total:,} params "
+            f"({100 * n_trainable / n_total:.1f}%)"
+        )
+        optimizer = AdamW(trainable, lr=lr, weight_decay=0.01)
+    else:
+        optimizer = AdamW(qwen3tts.model.parameters(), lr=lr, weight_decay=0.01)
+
     model, optimizer, train_dataloader = accelerator.prepare(
         qwen3tts.model, optimizer, train_dataloader,
     )
@@ -292,6 +317,8 @@ def train():
     parser.add_argument("--lr", type=float, default=2e-6)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
+    parser.add_argument("--freeze_talker", action="store_true",
+                        help="Freeze main LLM; only train speaker embedding + sub-talker (timbre)")
     args = parser.parse_args()
 
     with open(args.train_jsonl) as f:
@@ -305,6 +332,7 @@ def train():
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        freeze_talker=args.freeze_talker,
     )
 
     print(f"Training complete. Loss history: {result['loss_history']}")
