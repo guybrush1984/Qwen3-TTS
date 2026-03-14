@@ -881,11 +881,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         wav = hidden
         for block in self.decoder:
             wav = block(wav)
-        # Normalize peaks that exceed [-1, 1] instead of hard-clamping
-        # (hard clamp destroys information and causes audible distortion).
-        # Only scale down; never amplify quiet signals.
-        peak = wav.abs().amax(dim=-1, keepdim=True).clamp(min=1.0)
-        return wav / peak
+        return wav
 
     def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
         wavs = []
@@ -898,7 +894,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             sample_count = min((end_index - start_index) * self.total_upsample, wav_chunk.shape[-1])
             wavs.append(wav_chunk[..., -sample_count:])
             start_index = end_index
-        return torch.cat(wavs, dim=-1)
+        wav = torch.cat(wavs, dim=-1)
+        # Normalize peaks that exceed [-1, 1] once on the full waveform
+        # (not per-chunk) so volume stays consistent across chunk boundaries.
+        peak = wav.abs().amax(dim=-1, keepdim=True).clamp(min=1.0)
+        return wav / peak
 
 
 class Qwen3TTSTokenizerV2Encoder(MimiModel):
