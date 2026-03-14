@@ -113,8 +113,9 @@ def run_sft(
         # preserve timing/pacing/EOS behavior from the base model.
         for param in qwen3tts.model.talker.parameters():
             param.requires_grad = False
-        # Unfreeze speaker embedding slot
-        qwen3tts.model.talker.model.codec_embedding.weight.requires_grad = True
+        # codec_embedding stays frozen — speaker embedding is injected from
+        # speaker_encoder during training, then baked at save time. Training
+        # the table would drift all codec token embeddings and distort audio.
         # Unfreeze sub-talker (code_predictor)
         for param in qwen3tts.model.talker.code_predictor.parameters():
             param.requires_grad = True
