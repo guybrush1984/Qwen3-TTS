@@ -2065,6 +2065,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                         t = init_temp
                     else:
                         t = final_temp
+                    if self.step <= 3 or self.step == warmup_steps + 1:
+                        print(f"    [temp_schedule] step={self.step} temp={t}")
                     return scores / t
 
             logits_processor = LogitsProcessorList([_TemperatureSchedule()])
