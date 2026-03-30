@@ -217,18 +217,13 @@ def _train_step(
         ref_mels.to(model.device).to(model.dtype)
     ).detach()
 
-    # Track speaker embeddings for checkpoint baking.
-    # Accumulate all x-vectors per speaker and average at save time.
-    # This produces a representative embedding when training data mixes
-    # multiple source speakers under one speaker_id (blend training).
+    # Track speaker embeddings for checkpoint baking
     if "speaker_ids" in batch_data:
         for i, spk_id in enumerate(batch_data["speaker_ids"]):
             if spk_id not in speaker_embeddings:
-                speaker_embeddings[spk_id] = [speaker_embedding[i : i + 1]]
-            else:
-                speaker_embeddings[spk_id].append(speaker_embedding[i : i + 1])
+                speaker_embeddings[spk_id] = speaker_embedding[i : i + 1]
     elif not speaker_embeddings:
-        speaker_embeddings[speaker_names[0]] = [speaker_embedding]
+        speaker_embeddings[speaker_names[0]] = speaker_embedding
 
     input_text_ids = input_ids[:, :, 0]
     input_codec_ids = input_ids[:, :, 1]
@@ -329,14 +324,12 @@ def _save_checkpoint(
     for k in [k for k in state_dict if k.startswith("speaker_encoder")]:
         del state_dict[k]
 
-    # Bake speaker embeddings into codec_embedding weight.
-    # Average all accumulated x-vectors per speaker for a representative embedding.
+    # Bake speaker embeddings into codec_embedding weight
     weight = state_dict["talker.model.codec_embedding.weight"]
-    for spk_name, emb_list in speaker_embeddings.items():
+    for spk_name, emb in speaker_embeddings.items():
         idx = spk_id_map[spk_name]
-        avg_emb = torch.mean(torch.cat(emb_list, dim=0), dim=0)
-        weight[idx] = avg_emb.detach().to(weight.device).to(weight.dtype)
-        print(f"    Baked {spk_name} at index {idx} (averaged {len(emb_list)} x-vectors)")
+        weight[idx] = emb[0].detach().to(weight.device).to(weight.dtype)
+        print(f"    Baked {spk_name} at index {idx}")
 
     save_file(state_dict, os.path.join(ckpt_dir, "model.safetensors"))
     return ckpt_dir
