@@ -2034,6 +2034,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         top_k: int = 50,
         top_p: float = 1.0,
         temperature: float = 0.9,
+        temperature_warmup: Optional[tuple[float, int]] = None,
         subtalker_dosample: bool = True,
         subtalker_top_k: int = 50,
         subtalker_top_p: float = 1.0,
@@ -2042,13 +2043,41 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         repetition_penalty: float = 1.05,
         **kwargs,
     ):
+        # Temperature schedule: use low temp for the first N tokens to lock
+        # speaker identity (critical for blend embeddings), then raise to
+        # normal temp for natural prosody.
+        # temperature_warmup = (initial_temp, warmup_tokens)
+        # e.g. (0.1, 20) = 0.1 for first 20 tokens, then `temperature`.
+        logits_processor = None
+        effective_temperature = temperature
+        if temperature_warmup is not None:
+            from transformers import LogitsProcessor, LogitsProcessorList
+            init_temp, warmup_steps = temperature_warmup
+            final_temp = temperature
+
+            class _TemperatureSchedule(LogitsProcessor):
+                def __init__(self):
+                    self.step = 0
+
+                def __call__(self, input_ids, scores):
+                    self.step += 1
+                    if self.step <= warmup_steps:
+                        t = init_temp
+                    else:
+                        t = final_temp
+                    return scores / t
+
+            logits_processor = LogitsProcessorList([_TemperatureSchedule()])
+            # Disable built-in temperature warper (1.0 = no-op)
+            effective_temperature = 1.0
+
         talker_kwargs = {
             "max_new_tokens": max_new_tokens,
             "min_new_tokens": min_new_tokens,
             "do_sample": do_sample,
             "top_k": top_k,
             "top_p": top_p,
-            "temperature": temperature,
+            "temperature": effective_temperature,
             "subtalker_dosample": subtalker_dosample, 
             "subtalker_top_k": subtalker_top_k,
             "subtalker_top_p": subtalker_top_p,
@@ -2270,6 +2299,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         trailing_text_hiddens = padded_hiddens
 
         # forward
+        if logits_processor is not None:
+            talker_kwargs["logits_processor"] = logits_processor
         talker_result = self.talker.generate(
             inputs_embeds=talker_input_embeds,
             attention_mask=talker_attention_mask,
