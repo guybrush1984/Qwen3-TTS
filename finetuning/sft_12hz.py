@@ -124,6 +124,9 @@ def run_sft(
         # Unfreeze sub-talker (code_predictor)
         for param in qwen3tts.model.talker.code_predictor.parameters():
             param.requires_grad = True
+        # Unfreeze speaker_conditioner (per-layer speaker bias)
+        for param in qwen3tts.model.talker.model.speaker_conditioner.parameters():
+            param.requires_grad = True
 
         if training_strategy == "voice_and_prosody":
             # Also unfreeze codec_head — the linear layer that predicts
@@ -281,6 +284,7 @@ def _train_step(
         inputs_embeds=input_embeddings[:, :-1, :],
         attention_mask=attention_mask[:, :-1],
         output_hidden_states=True,
+        speaker_embed=speaker_embedding,
     )
 
     logits = outputs.logits

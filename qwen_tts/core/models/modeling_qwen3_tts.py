@@ -1343,6 +1343,7 @@ class Qwen3TTSTalkerOutputWithPast(ModelOutput):
     generation_step: Optional[int] = None
     trailing_text_hidden: Optional[torch.FloatTensor] = None
     tts_pad_embed: Optional[torch.FloatTensor] = None
+    speaker_embed: Optional[torch.FloatTensor] = None
 
 
 class Qwen3TTSTalkerDecoderLayer(GradientCheckpointingLayer):
@@ -1424,6 +1425,43 @@ class Qwen3TTSTalkerDecoderLayer(GradientCheckpointingLayer):
         return outputs
 
 
+class SpeakerConditioner(nn.Module):
+    """Per-layer speaker conditioning: projects speaker embedding into a bias
+    added to hidden states after each transformer layer.
+
+    Initialized to zero so pretrained weights produce identical output before
+    any fine-tuning of the conditioner parameters.
+    """
+
+    def __init__(self, num_layers: int, hidden_size: int):
+        super().__init__()
+        self.projections = nn.ModuleList([
+            nn.Linear(hidden_size, hidden_size, bias=False)
+            for _ in range(num_layers)
+        ])
+        self.gates = nn.ParameterList([
+            nn.Parameter(torch.zeros(1))
+            for _ in range(num_layers)
+        ])
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """Zero-init all projections and gates so the conditioner is a no-op."""
+        for proj in self.projections:
+            nn.init.zeros_(proj.weight)
+        for gate in self.gates:
+            gate.data.zero_()
+
+    def apply_layer(self, layer_idx: int, hidden_states: torch.Tensor,
+                    speaker_embed: torch.Tensor) -> torch.Tensor:
+        """Add speaker bias to hidden states for a given layer.
+
+        speaker_embed: [batch, hidden_size] — will be broadcast over seq_len.
+        """
+        bias = self.projections[layer_idx](speaker_embed)  # [batch, hidden_size]
+        return hidden_states + self.gates[layer_idx].tanh() * bias.unsqueeze(1)
+
+
 class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
     config_class = Qwen3TTSTalkerConfig
     base_model_prefix = "talker.model"
@@ -1440,9 +1478,14 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         self.gradient_checkpointing = False
         self.codec_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.text_embedding = nn.Embedding(config.text_vocab_size, config.text_hidden_size)
+        self.speaker_conditioner = SpeakerConditioner(config.num_hidden_layers, config.hidden_size)
 
         # Initialize weights and apply final processing
         self.post_init()
+
+        # Re-zero speaker_conditioner after post_init (which calls _init_weights
+        # on all Linear modules with random normal init)
+        self.speaker_conditioner.reset_parameters()
 
     def get_input_embeddings(self):
         return self.codec_embedding
@@ -1465,6 +1508,7 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        speaker_embed: Optional[torch.Tensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1526,7 +1570,7 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        for decoder_layer in self.layers:
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1543,6 +1587,11 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
             )
 
             hidden_states = layer_outputs[0]
+
+            if speaker_embed is not None:
+                hidden_states = self.speaker_conditioner.apply_layer(
+                    layer_idx, hidden_states, speaker_embed,
+                )
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -1653,6 +1702,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         subtalker_top_p=None,
         subtalker_top_k=None,
         subtalker_temperature=None,
+        speaker_embed=None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         r"""
@@ -1720,6 +1770,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
+            speaker_embed=speaker_embed,
             **kwargs,
         )
 
@@ -1741,6 +1792,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             generation_step=generation_step + 1,
             trailing_text_hidden=trailing_text_hidden,
             tts_pad_embed=tts_pad_embed,
+            speaker_embed=speaker_embed,
         )
 
     def get_rope_index(
@@ -1807,6 +1859,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         model_kwargs["generation_step"] = outputs.generation_step
         model_kwargs["trailing_text_hidden"] = outputs.trailing_text_hidden
         model_kwargs["tts_pad_embed"] = outputs.tts_pad_embed
+        model_kwargs["speaker_embed"] = outputs.speaker_embed
         return model_kwargs
 
 
@@ -2098,6 +2151,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         }
         
         talker_input_embeds = [[] for _ in range(len(input_ids))]
+        speaker_embeds_for_conditioner = []
 
         voice_clone_spk_embeds = None
         # voice clone speaker prompt generate
@@ -2136,6 +2190,10 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                     speaker_embed = voice_clone_spk_embeds[index]
                 else:
                     speaker_embed = None
+
+            speaker_embeds_for_conditioner.append(
+                speaker_embed.detach() if speaker_embed is not None else None
+            )
 
             assert language is not None
 
@@ -2303,11 +2361,24 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         # forward
         if logits_processor is not None:
             talker_kwargs["logits_processor"] = logits_processor
+        # Stack speaker embeddings for per-layer conditioning (None if no speakers)
+        if any(e is not None for e in speaker_embeds_for_conditioner):
+            # Use zeros for items without a speaker embed
+            dim = next(e.shape[-1] for e in speaker_embeds_for_conditioner if e is not None)
+            batched_speaker_embed = torch.stack([
+                e if e is not None else torch.zeros(dim, device=talker_input_embeds.device, dtype=talker_input_embeds.dtype)
+                for e in speaker_embeds_for_conditioner
+            ])
+            if batched_speaker_embed.ndim == 3:
+                batched_speaker_embed = batched_speaker_embed.squeeze(1)
+        else:
+            batched_speaker_embed = None
         talker_result = self.talker.generate(
             inputs_embeds=talker_input_embeds,
             attention_mask=talker_attention_mask,
             trailing_text_hidden=trailing_text_hiddens,
             tts_pad_embed=tts_pad_embed,
+            speaker_embed=batched_speaker_embed,
             **talker_kwargs,
         )
 
