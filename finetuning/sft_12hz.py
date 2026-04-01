@@ -57,7 +57,6 @@ def run_sft(
     keep_all_checkpoints: bool = False,
     training_strategy: str = "full",
     on_epoch_end: Optional[Callable[[int, str, float], None]] = None,
-    precomputed_embeddings: Optional[dict[str, torch.Tensor]] = None,
 ) -> dict:
     """Core SFT training loop.
 
@@ -83,10 +82,6 @@ def run_sft(
                                  training only sub-talker layers/heads + speaker
                                  embedding.
         on_epoch_end: Callback(epoch, checkpoint_dir, avg_loss) after each epoch save.
-        precomputed_embeddings: Optional dict mapping speaker_id → embedding tensor
-            (shape [1, dim]). When provided, these override the speaker_encoder
-            output for matching speaker_ids during training and baking. Used for
-            blend voices where the embedding is a weighted average of source speakers.
 
     Returns:
         {"loss_history": [...], "speaker_id_map": {name: idx}, "speaker_embeddings": {name: tensor}}
@@ -152,19 +147,7 @@ def run_sft(
         qwen3tts.model, optimizer, train_dataloader,
     )
 
-    # Precomputed embeddings override speaker_encoder for specified speakers.
-    # Move them to the model's device/dtype so they can be injected directly.
-    _precomputed: dict[str, torch.Tensor] = {}
-    if precomputed_embeddings:
-        for spk_id, emb in precomputed_embeddings.items():
-            _precomputed[spk_id] = emb.to(device=accelerator.device, dtype=torch.bfloat16)
-            accelerator.print(f"  Using precomputed embedding for '{spk_id}' "
-                              f"(norm={emb.norm().item():.2f})")
-
     speaker_embeddings: dict[str, torch.Tensor] = {}
-    # Seed baking dict with precomputed embeddings immediately
-    for spk_id, emb in _precomputed.items():
-        speaker_embeddings[spk_id] = emb
 
     model.train()
     loss_history = []
@@ -175,7 +158,7 @@ def run_sft(
             with accelerator.accumulate(model):
                 loss = _train_step(
                     model, batch_data, speaker_names, speaker_embeddings,
-                    sub_talker_weight, _precomputed,
+                    sub_talker_weight,
                 )
 
                 accelerator.backward(loss)
@@ -229,7 +212,6 @@ def _train_step(
     speaker_names: list[str],
     speaker_embeddings: dict[str, torch.Tensor],
     sub_talker_weight: float,
-    precomputed: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Single training step. Returns the combined loss."""
     input_ids = batch_data["input_ids"]
@@ -244,12 +226,6 @@ def _train_step(
     speaker_embedding = model.speaker_encoder(
         ref_mels.to(model.device).to(model.dtype)
     ).detach()
-
-    # Override with precomputed embeddings for blend speakers
-    if precomputed and "speaker_ids" in batch_data:
-        for i, spk_id in enumerate(batch_data["speaker_ids"]):
-            if spk_id in precomputed:
-                speaker_embedding[i] = precomputed[spk_id][0]
 
     # Track speaker embeddings for checkpoint baking
     if "speaker_ids" in batch_data:
