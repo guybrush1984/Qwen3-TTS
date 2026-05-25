@@ -57,7 +57,6 @@ def run_sft(
     keep_all_checkpoints: bool = False,
     training_strategy: str = "full",
     on_epoch_end: Optional[Callable[[int, str, float], None]] = None,
-    precomputed_embeddings: Optional[dict[str, torch.Tensor]] = None,
 ) -> dict:
     """Core SFT training loop.
 
@@ -83,10 +82,6 @@ def run_sft(
                                  training only sub-talker layers/heads + speaker
                                  embedding.
         on_epoch_end: Callback(epoch, checkpoint_dir, avg_loss) after each epoch save.
-        precomputed_embeddings: Optional dict mapping speaker_id → embedding tensor
-            (shape [1, dim]). When provided, these override the speaker_encoder
-            output for matching speaker_ids during training and baking. Used for
-            blend voices where the embedding is a weighted average of source speakers.
 
     Returns:
         {"loss_history": [...], "speaker_id_map": {name: idx}, "speaker_embeddings": {name: tensor}}
@@ -152,19 +147,7 @@ def run_sft(
         qwen3tts.model, optimizer, train_dataloader,
     )
 
-    # Precomputed embeddings override speaker_encoder for specified speakers.
-    # Move them to the model's device/dtype so they can be injected directly.
-    _precomputed: dict[str, torch.Tensor] = {}
-    if precomputed_embeddings:
-        for spk_id, emb in precomputed_embeddings.items():
-            _precomputed[spk_id] = emb.to(device=accelerator.device, dtype=torch.bfloat16)
-            accelerator.print(f"  Using precomputed embedding for '{spk_id}' "
-                              f"(norm={emb.norm().item():.2f})")
-
     speaker_embeddings: dict[str, torch.Tensor] = {}
-    # Seed baking dict with precomputed embeddings immediately
-    for spk_id, emb in _precomputed.items():
-        speaker_embeddings[spk_id] = emb
 
     model.train()
     loss_history = []
@@ -175,7 +158,7 @@ def run_sft(
             with accelerator.accumulate(model):
                 loss = _train_step(
                     model, batch_data, speaker_names, speaker_embeddings,
-                    sub_talker_weight, _precomputed,
+                    sub_talker_weight,
                 )
 
                 accelerator.backward(loss)
@@ -214,13 +197,21 @@ def run_sft(
     }
 
 
+def _get_talker(model):
+    """Resolve the talker module, handling PEFT wrappers."""
+    talker = model.talker
+    # If PEFT-wrapped, get the underlying model
+    if hasattr(talker, "base_model"):
+        return talker.base_model.model
+    return talker
+
+
 def _train_step(
     model,
     batch_data: dict,
     speaker_names: list[str],
     speaker_embeddings: dict[str, torch.Tensor],
     sub_talker_weight: float,
-    precomputed: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Single training step. Returns the combined loss."""
     input_ids = batch_data["input_ids"]
@@ -236,12 +227,6 @@ def _train_step(
         ref_mels.to(model.device).to(model.dtype)
     ).detach()
 
-    # Override with precomputed embeddings for blend speakers
-    if precomputed and "speaker_ids" in batch_data:
-        for i, spk_id in enumerate(batch_data["speaker_ids"]):
-            if spk_id in precomputed:
-                speaker_embedding[i] = precomputed[spk_id][0]
-
     # Track speaker embeddings for checkpoint baking
     if "speaker_ids" in batch_data:
         for i, spk_id in enumerate(batch_data["speaker_ids"]):
@@ -250,17 +235,18 @@ def _train_step(
     elif not speaker_embeddings:
         speaker_embeddings[speaker_names[0]] = speaker_embedding
 
+    talker = _get_talker(model)
     input_text_ids = input_ids[:, :, 0]
     input_codec_ids = input_ids[:, :, 1]
 
     # Text embedding with projection (needed for 0.6B model)
-    input_text_embedding = model.talker.model.text_embedding(input_text_ids)
-    if hasattr(model.talker, "text_projection"):
-        input_text_embedding = model.talker.text_projection(input_text_embedding)
+    input_text_embedding = talker.model.text_embedding(input_text_ids)
+    if hasattr(talker, "text_projection"):
+        input_text_embedding = talker.text_projection(input_text_embedding)
     input_text_embedding = input_text_embedding * text_embedding_mask
 
     input_codec_embedding = (
-        model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+        talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
     )
     input_codec_embedding[:, 6, :] = speaker_embedding
 
@@ -269,14 +255,14 @@ def _train_step(
     # Add sub-talker codec layers 1-15 to input embeddings.
     # Reverted removal from PR #178 — removing these caused speech to be too fast.
     for i in range(1, 16):
-        codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](
+        codec_i_embedding = talker.code_predictor.get_input_embeddings()[i - 1](
             codec_ids[:, :, i]
         )
         codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
         input_embeddings = input_embeddings + codec_i_embedding
 
-    # Main AR forward — don't pass labels= (HF shifts internally, causing
-    # double-shift). See: github.com/QwenLM/Qwen3-TTS/issues/179
+    # Main AR forward — use model.talker (possibly PEFT-wrapped) so LoRA
+    # layers are in the forward path.
     outputs = model.talker(
         inputs_embeds=input_embeddings[:, :-1, :],
         attention_mask=attention_mask[:, :-1],
@@ -294,7 +280,7 @@ def _train_step(
     talker_hidden_states = hidden_states[codec_mask[:, 1:]]
     talker_codec_ids = codec_ids[codec_mask]
 
-    sub_talker_logits, _ = model.talker.forward_sub_talker_finetune(
+    sub_talker_logits, _ = talker.forward_sub_talker_finetune(
         talker_codec_ids, talker_hidden_states,
     )
     sub_talker_loss = F.cross_entropy(
@@ -358,6 +344,236 @@ def _save_checkpoint(
 
     save_file(state_dict, os.path.join(ckpt_dir, "model.safetensors"))
     return ckpt_dir
+
+
+def run_lora_sft(
+    model_path: str,
+    train_data: list[dict],
+    speaker_name: str,
+    output_dir: str,
+    num_epochs: int = 10,
+    batch_size: int = 2,
+    lr: float = 5e-5,
+    gradient_accumulation_steps: int = 4,
+    sub_talker_weight: float = 0.3,
+    lora_rank: int = 16,
+    lora_alpha: int = 32,
+    on_epoch_end: Optional[Callable[[int, str, float], None]] = None,
+) -> dict:
+    """LoRA fine-tuning for a single speaker.
+
+    Trains a lightweight LoRA adapter on the talker's attention layers +
+    codec_head + sub-talker. The adapter can later be merged with others
+    via merge_lora_checkpoints() for voice blending.
+
+    Returns:
+        {"loss_history": [...], "speaker_embedding": tensor, "adapter_dir": str}
+    """
+    from peft import LoraConfig, get_peft_model
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        mixed_precision="bf16",
+    )
+
+    qwen3tts = Qwen3TTSModel.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    )
+    config = AutoConfig.from_pretrained(model_path)
+
+    dataset = TTSDataset(train_data, qwen3tts.processor, config)
+    train_dataloader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, collate_fn=dataset.collate_fn,
+    )
+
+    # Apply LoRA to the talker model (attention projections + codec_head + sub-talker)
+    lora_config = LoraConfig(
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        target_modules=[
+            "q_proj", "v_proj", "k_proj", "o_proj",  # attention
+            "gate_proj", "up_proj", "down_proj",       # MLP
+        ],
+        lora_dropout=0.05,
+        bias="none",
+    )
+    # Apply LoRA only to the talker (main LLM), not speaker_encoder
+    qwen3tts.model.talker = get_peft_model(qwen3tts.model.talker, lora_config)
+    qwen3tts.model.talker.print_trainable_parameters()
+
+    # Also train the sub-talker (code_predictor) fully — it's small
+    for param in qwen3tts.model.talker.base_model.model.code_predictor.parameters():
+        param.requires_grad = True
+
+    optimizer = AdamW(
+        [p for p in qwen3tts.model.parameters() if p.requires_grad],
+        lr=lr, weight_decay=0.01,
+    )
+
+    model, optimizer, train_dataloader = accelerator.prepare(
+        qwen3tts.model, optimizer, train_dataloader,
+    )
+
+    speaker_embeddings: dict[str, torch.Tensor] = {}
+    model.train()
+    loss_history = []
+
+    for epoch in range(num_epochs):
+        epoch_losses = []
+        for step, batch_data in enumerate(train_dataloader):
+            with accelerator.accumulate(model):
+                loss = _train_step(
+                    model, batch_data, [speaker_name], speaker_embeddings,
+                    sub_talker_weight,
+                )
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            loss_val = loss.item()
+            epoch_losses.append(loss_val)
+            if step % 10 == 0:
+                accelerator.print(
+                    f"  Epoch {epoch} | Step {step} | Loss: {loss_val:.4f}"
+                )
+
+        avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0
+        loss_history.append(avg_loss)
+        accelerator.print(f"  Epoch {epoch} complete | Avg Loss: {avg_loss:.4f}")
+
+        if accelerator.is_main_process:
+            adapter_dir = os.path.join(output_dir, f"lora-{speaker_name}-epoch-{epoch}")
+            unwrapped = accelerator.unwrap_model(model)
+            unwrapped.talker.save_pretrained(adapter_dir)
+            accelerator.print(f"  Saved LoRA adapter: {adapter_dir}")
+
+            # Clean up previous epoch
+            if epoch > 0:
+                prev = os.path.join(output_dir, f"lora-{speaker_name}-epoch-{epoch - 1}")
+                if os.path.exists(prev):
+                    shutil.rmtree(prev)
+
+            if on_epoch_end:
+                on_epoch_end(epoch, adapter_dir, avg_loss)
+
+    return {
+        "loss_history": loss_history,
+        "speaker_embedding": speaker_embeddings.get(speaker_name),
+        "adapter_dir": os.path.join(output_dir, f"lora-{speaker_name}-epoch-{num_epochs - 1}"),
+    }
+
+
+def merge_lora_checkpoints(
+    model_path: str,
+    adapter_specs: list[dict],
+    speaker_embeddings: dict[str, torch.Tensor],
+    output_dir: str,
+) -> str:
+    """Merge multiple LoRA adapters into a single checkpoint.
+
+    adapter_specs: [{"adapter_dir": str, "weight": float, "speaker_name": str}, ...]
+    speaker_embeddings: {speaker_name: tensor} for baking into codec_embedding
+    output_dir: where to save the merged checkpoint
+
+    Returns: path to the merged checkpoint directory.
+    """
+    from peft import PeftModel
+
+    accelerator = Accelerator()
+
+    # Load base model
+    qwen3tts = Qwen3TTSModel.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    )
+
+    # Get base state dict
+    base_state = {
+        k: v.clone() for k, v in qwen3tts.model.talker.state_dict().items()
+    }
+
+    # Load each adapter, get the merged delta, and accumulate
+    merged_delta: dict[str, torch.Tensor] = {}
+    for spec in adapter_specs:
+        adapter_dir = spec["adapter_dir"]
+        weight = spec["weight"]
+        spk_name = spec["speaker_name"]
+        accelerator.print(f"  Loading adapter: {spk_name} (weight={weight:.2f}) from {adapter_dir}")
+
+        # Load adapter on top of base
+        talker_with_lora = PeftModel.from_pretrained(
+            qwen3tts.model.talker, adapter_dir,
+        )
+        # Merge LoRA into base weights
+        talker_with_lora = talker_with_lora.merge_and_unload()
+        merged_state = talker_with_lora.state_dict()
+
+        # Compute delta = merged - base, accumulate with weight
+        for k in merged_state:
+            if k in base_state:
+                delta = merged_state[k] - base_state[k]
+                if k not in merged_delta:
+                    merged_delta[k] = weight * delta
+                else:
+                    merged_delta[k] += weight * delta
+
+        # Reload base for next adapter
+        del talker_with_lora
+        qwen3tts.model.talker.load_state_dict(base_state)
+
+    # Apply merged delta to base
+    final_state = {}
+    for k, v in base_state.items():
+        if k in merged_delta:
+            final_state[k] = v + merged_delta[k]
+        else:
+            final_state[k] = v
+
+    # Build full model state dict (talker + speaker_encoder stripped)
+    full_state = {
+        k: v.detach().to("cpu")
+        for k, v in qwen3tts.model.state_dict().items()
+        if not k.startswith("speaker_encoder")
+    }
+    # Override talker weights with merged ones
+    for k, v in final_state.items():
+        full_key = f"talker.{k}"
+        if full_key in full_state:
+            full_state[full_key] = v.detach().to("cpu")
+
+    # Bake speaker embeddings
+    spk_id_map = {name: 3000 + i for i, name in enumerate(speaker_embeddings.keys())}
+    weight = full_state["talker.model.codec_embedding.weight"]
+    for spk_name, emb in speaker_embeddings.items():
+        idx = spk_id_map[spk_name]
+        weight[idx] = emb[0].detach().to(weight.device).to(weight.dtype)
+        print(f"    Baked {spk_name} at index {idx}")
+
+    # Save checkpoint
+    os.makedirs(output_dir, exist_ok=True)
+    shutil.copytree(model_path, output_dir, dirs_exist_ok=True)
+
+    # Update config
+    config_file = os.path.join(output_dir, "config.json")
+    import json as _json
+    with open(config_file) as f:
+        config_dict = _json.load(f)
+    config_dict["tts_model_type"] = "custom_voice"
+    tc = config_dict.get("talker_config", {})
+    tc["spk_id"] = spk_id_map
+    tc["spk_is_dialect"] = {name: False for name in spk_id_map}
+    config_dict["talker_config"] = tc
+    with open(config_file, "w") as f:
+        _json.dump(config_dict, f, indent=2, ensure_ascii=False)
+
+    save_file(full_state, os.path.join(output_dir, "model.safetensors"))
+    accelerator.print(f"  Merged checkpoint saved: {output_dir}")
+    return output_dir
 
 
 def train():
